@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import pandas as pd
+import asyncio
 from googletrans import Translator
 
 ### Functions
@@ -55,8 +56,6 @@ def select_name(names, message):
 
 # Select excel file, sheet and colum, extract dataframe
 def load_file():
-    root = tk.Tk()
-    root.withdraw()  # Hide the root window
     messagebox.showinfo("Close", "If the excel file you want to process is open, please close it before proceeding")
     file_name = filedialog.askopenfilename(title="Load the excel file you want to process", filetypes=[("Excel files", "*.xls;*.xlsx;*.xlsm")])
     if not file_name:
@@ -72,9 +71,8 @@ def load_file():
         src_col = select_name(cols, "source column")
         trans_col = select_name(cols, "translated coulmn")
 
-        file_df = pd.read_excel(file_name, sheet_name=sheet_name, usecols=[src_col, trans_col]).dropna(how="any")
-
-        print(f"\n{file_df.fillna("").to_string}")  # Replace nan with empty string
+        file_df = pd.read_excel(file_name, sheet_name=sheet_name, usecols=[src_col, trans_col])
+        print(f"\n{file_df.fillna("").to_string(max_rows=10)}")  # Replace nan with empty string
     except Exception as e:
         print(f"\nError: {str(e)}. Exiting...")
         exit()
@@ -83,38 +81,49 @@ def load_file():
 
 ## Translate col_origin to col_translated
 # Apply the mapping to the origin column with fallback to Google Translate
-def translate_value(value, translation_map):
+async def translate_value(value, translation_map, src_lang, trans_lang):
+    translator = Translator()
+
+    # Check if the value is in the translation map
     if value in translation_map and pd.notna(translation_map[value]):
         return translation_map[value]  # Use dictionary translation
     else:
+        # If not in the map, use Google Translate
         try:
-            return translator.translate(value, src=src_lang, dest=dest_lang).text  # Use Google Translate
+            translation = await translator.translate(value, src=src_lang, dest=trans_lang)
+            return translation.text  # Use Google Translate
         except Exception as e:
             print(f"Translation error for '{value}': {str(e)}")
             return value  # Return the original value if translation fails
 
-#
-def translate_column(file_df, src_col, trans_col):
+# Translate the specified column in the dataframe
+async def translate_column(file_df, src_col, trans_col):
     # Create a mapping from origin to translated
-    translation_map = dict(zip(file_df[col_origin], file_df[col_translated]))
-    translator = Translator()
+    translation_map = dict(zip(file_df[src_col], file_df[trans_col]))
 
     # Select languages for translation
-    src_lang = select_name(["en", "es", "fr", "de", "it", "pt"], "source language")
-    trans_lang = select_name(["en", "es", "fr", "de", "it", "pt"], "translated language")
+    languages = ["en", "es", "fr", "de", "it", "pt"]
+    src_lang = select_name(languages, "source language")
+    trans_lang = select_name(languages, "translated language")
 
-    file_df[col_origin] = file_df[col_origin].apply(translate_value)
+    # Apply translation asynchronously
+    async def translate_row(value):
+        return await translate_value(value, translation_map, src_lang, trans_lang)
+
+    file_df[trans_col] = await asyncio.gather(*[translate_row(value) for value in file_df[src_col]])
+    print(f"\n{file_df.fillna('').to_string(max_rows=10)}")  # Replace nan with empty string
 
     return file_df
-dfd
+
 ### Main
 
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
 
-    ## Load excel file and create dataframes for map and list
+    # Load excel file and create dataframes for map and list
     messagebox.showinfo("Empty", "Words present in the translated columns will be kept. Please make sure to delete unwanted cells before proceeding")
-    file_df, src_col, trans_col = load_file()
+    file_name, file_df, src_col, trans_col = load_file()
 
-    file_df = translate_column(file_df, src_col, trans_col)
+    # Run the asynchronous translation
+    file_df = asyncio.run(translate_column(file_df, src_col, trans_col))
