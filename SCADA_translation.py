@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox
 import pandas as pd
 import asyncio
 from googletrans import Translator
+from tqdm import tqdm
 
 ### Functions
 
@@ -81,8 +82,14 @@ def load_file():
 
 ## Translate col_origin to col_translated
 # Apply the mapping to the origin column with fallback to Google Translate
+# Translate the specified column in the dataframe
+# Asynchronous translation function
 async def translate_value(value, translation_map, src_lang, trans_lang):
     translator = Translator()
+
+    # Skip translation for empty cells
+    if pd.isna(value) or value == "":
+        return value  # Return the original value if it's empty
 
     # Check if the value is in the translation map
     if value in translation_map and pd.notna(translation_map[value]):
@@ -96,8 +103,11 @@ async def translate_value(value, translation_map, src_lang, trans_lang):
             print(f"Translation error for '{value}': {str(e)}")
             return value  # Return the original value if translation fails
 
-# Translate the specified column in the dataframe
-async def translate_column(file_df, src_col, trans_col):
+# Asynchronous translation column function
+async def translate_column_async(file_df, src_col, trans_col):
+    # Extract unique values from the source column
+    unique_values = file_df[src_col].dropna().unique()
+
     # Create a mapping from origin to translated
     translation_map = dict(zip(file_df[src_col], file_df[trans_col]))
 
@@ -106,13 +116,15 @@ async def translate_column(file_df, src_col, trans_col):
     src_lang = select_name(languages, "source language")
     trans_lang = select_name(languages, "translated language")
 
-    # Apply translation asynchronously
-    async def translate_row(value):
-        return await translate_value(value, translation_map, src_lang, trans_lang)
+    # Translate unique values and update the translation map
+    for value in tqdm(unique_values, desc="Translating unique values"):
+        if value not in translation_map or pd.isna(translation_map[value]):
+            translation_map[value] = await translate_value(value, translation_map, src_lang, trans_lang)
 
-    file_df[trans_col] = await asyncio.gather(*[translate_row(value) for value in file_df[src_col]])
+    # Apply the translation map to the entire column
+    file_df[trans_col] = file_df[src_col].map(translation_map).fillna(file_df[src_col])
+
     print(f"\n{file_df.fillna('').to_string(max_rows=10)}")  # Replace nan with empty string
-
     return file_df
 
 ### Main
@@ -126,4 +138,4 @@ if __name__ == "__main__":
     file_name, file_df, src_col, trans_col = load_file()
 
     # Run the asynchronous translation
-    file_df = asyncio.run(translate_column(file_df, src_col, trans_col))
+    file_df = asyncio.run(translate_column_async(file_df, src_col, trans_col))
