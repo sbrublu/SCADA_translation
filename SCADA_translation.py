@@ -6,6 +6,8 @@ import pandas as pd
 import asyncio
 from googletrans import Translator
 from tqdm import tqdm
+import openpyxl
+import shutil
 
 ### Functions
 
@@ -78,12 +80,10 @@ def load_file():
         print(f"\nError: {str(e)}. Exiting...")
         exit()
 
-    return file_name, file_df, src_col, trans_col
+    return file_name, sheet_name, file_df, cols, src_col, trans_col
 
 ## Translate col_origin to col_translated
 # Apply the mapping to the origin column with fallback to Google Translate
-# Translate the specified column in the dataframe
-# Asynchronous translation function
 async def translate_value(value, translation_map, src_lang, trans_lang):
     translator = Translator()
 
@@ -103,7 +103,7 @@ async def translate_value(value, translation_map, src_lang, trans_lang):
             print(f"Translation error for '{value}': {str(e)}")
             return value  # Return the original value if translation fails
 
-# Asynchronous translation column function
+# Translate the specified column in the dataframe
 async def translate_column_async(file_df, src_col, trans_col):
     # Extract unique values from the source column
     unique_values = file_df[src_col].dropna().unique()
@@ -127,6 +127,32 @@ async def translate_column_async(file_df, src_col, trans_col):
     print(f"\n{file_df.fillna('').to_string(max_rows=10)}")  # Replace nan with empty string
     return file_df
 
+## Write to excel file
+# Write translated column to excel file
+def write_trans_col(file_name, sheet_name, file_df, cols, trans_col):
+    try:
+        # Create a copy of the original file
+        copied_file_name = file_name.replace(".xlsx", "_translated.xlsx")
+        shutil.copy(file_name, copied_file_name)
+
+        wb = openpyxl.load_workbook(opied_file_name, keep_vba=True)  # Ensure VBA macros are preserved
+        if not sheet_name in wb.sheetnames:
+            print(f"\nSheet {sheet_name} not found in the workbook.Exiting...")
+            exit()
+
+        ws = wb[sheet_name]
+
+        # Write the translated column to the sheet
+        for r_idx, value in enumerate(file_df[trans_col], start=1):  # Write values from the translated column
+            ws.cell(row=r_idx + 1, column=cols.index(trans_col) + 1, value=value)  # Write to the column defined by trans_col
+
+        wb.save(copied_file_name)
+        wb.close()
+
+    except Exception as e:
+        print(f"\nError writing to Excel: {str(e)}. Exiting...")
+        exit()
+
 ### Main
 
 if __name__ == "__main__":
@@ -135,7 +161,10 @@ if __name__ == "__main__":
 
     # Load excel file and create dataframes for map and list
     messagebox.showinfo("Empty", "Words present in the translated columns will be kept. Please make sure to delete unwanted cells before proceeding")
-    file_name, file_df, src_col, trans_col = load_file()
+    file_name, sheet_name, file_df, cols, src_col, trans_col = load_file()
 
     # Run the asynchronous translation
     file_df = asyncio.run(translate_column_async(file_df, src_col, trans_col))
+
+    # Write the translated column to the excel file
+    write_trans_col(file_name, sheet_name, file_df, cols, trans_col)
