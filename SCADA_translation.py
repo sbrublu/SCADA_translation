@@ -135,7 +135,7 @@ def write_trans_col(file_name, sheet_name, file_df, cols, trans_col):
         copied_file_name = file_name.replace(".xlsx", "_translated.xlsx")
         shutil.copy(file_name, copied_file_name)
 
-        wb = openpyxl.load_workbook(opied_file_name, keep_vba=True)  # Ensure VBA macros are preserved
+        wb = openpyxl.load_workbook(copied_file_name, keep_vba=True)  # Ensure VBA macros are preserved
         if not sheet_name in wb.sheetnames:
             print(f"\nSheet {sheet_name} not found in the workbook.Exiting...")
             exit()
