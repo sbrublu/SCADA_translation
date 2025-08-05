@@ -70,22 +70,39 @@ def load_file():
         print("No file selected. Exiting...")
         exit()
 
+    excel_file = pd.ExcelFile(file_name)
+    sheets = excel_file.sheet_names
+    sheet_name = select_name(sheets, "excel sheet")
+
+    return file_name, sheet_name
+
+# Load the selected columns from the specified sheet in the excel file
+def load_columns(file_name, sheet_name):
+    excel_file = pd.ExcelFile(file_name)
     # Load the selected excel sheet into a dataframe
     try:
-        excel_file = pd.ExcelFile(file_name)
-        sheets = excel_file.sheet_names
-        sheet_name = select_name(sheets, "excel sheet")
         cols = excel_file.parse(sheet_name).columns.tolist()
         src_col = select_name(cols, "source column")
         trans_col = select_name(cols, "translated coulmn")
 
-        file_df = pd.read_excel(file_name, sheet_name=sheet_name, usecols=[src_col, trans_col])
-        print(f"\n{file_df.fillna("").to_string(max_rows=20)}")  # Replace nan with empty string
     except Exception as e:
         print(f"\nError: {str(e)}. Exiting...")
         exit()
 
-    return file_name, sheet_name, file_df, cols, src_col, trans_col
+    return src_col, trans_col
+
+# Load the specified columns from the excel file into a dataframe
+def load_df(file_name, sheet_name, src_col, trans_col):
+    # Load the selected excel sheet into a dataframe
+    try:
+        file_df = pd.read_excel(file_name, sheet_name=sheet_name, usecols=[src_col, trans_col])
+        print(f"\n{file_df.fillna("").to_string(max_rows=20)}")  # Replace nan with empty string
+
+    except Exception as e:
+        print(f"\nError: {str(e)}. Exiting...")
+        exit()
+
+    return file_df
 
 ## Translate col_origin to col_translated
 # Get a synonym for a word using WordNet
@@ -100,14 +117,8 @@ def get_synonym(word):
     return word
 
 # Abbreviate a word
-def abbreviate_word(word):
-    # Abbreviate words longer than 5 characters: keep first 4 letters, add a dot
-    if len(word) > 5:
-        return word[:4] + '.'
-    return word
-
 # Shorten the translation using synonyms or abbreviations
-def shorten_translation(original, translated):
+def shorten_translation(original, translated, delta):
     words = translated.split()
     # 1. Try to shorten with synonyms
     new_words = []
@@ -117,143 +128,164 @@ def shorten_translation(original, translated):
             new_words.append(synonym)
         else:
             new_words.append(w)
-    # 2. If still too long, abbreviate longest words as needed
+    # 2. If still too long, abbreviate longest words as needed using replace
     word_forms = [(w, w) for w in new_words]
     sorted_indices = sorted(range(len(new_words)), key=lambda i: -len(new_words[i]))
-    shortened = ' '.join(w for _, w in word_forms)
+    shortened = translated
     for idx in sorted_indices:
-        if len(shortened) <= len(original):
-            break
         orig, _ = word_forms[idx]
-        abbr = abbreviate_word(orig)
+        if len(shortened) <= len(original) or delta <= 0 or len(orig) <= 5:
+            break
+        abbr_len = max(4, len(orig) - delta - 1)
+        abbr = orig[:abbr_len] + '.'
+        delta -= (len(orig) - len(abbr))
         word_forms[idx] = (orig, abbr)
-        shortened = ' '.join(w for _, w in word_forms)
+        # Replace only the first occurrence of the word in the string
+        shortened = re.sub(r'\b{}\b'.format(re.escape(orig)), abbr, shortened, count=1)
+        # Adjust delta based on the effective length change
     return shortened
 
 # Apply the translation mapping with fallback to Google Translate
-async def translate_value(value, translation_map, src_lang, trans_lang):
+async def translate_value(value, dictionary, src_lang, trans_lang):
     translator = Translator()
-
-    # Skip translation for empty cells
-    if pd.isna(value) or value == "":
-        return value  # Return the original value if it's empty
+    value_key = str(value).strip().lower()
 
     # Check if the value is in the translation map
-    if value in translation_map and pd.notna(translation_map[value]):
-        return translation_map[value]  # Use dictionary translation
+    if value in dictionary and pd.notna(dictionary[value]):
+        translation = dictionary[value]  # Use dictionary translation
+        class Dummy: pass
+        dummy = Dummy()
+        dummy.text = translation
+        translation = dummy
     else:
         # If not in the map, use Google Translate
         try:
             translation = await translator.translate(value, src=src_lang, dest=trans_lang)
-            translated_text = translation.text
-
-            # Enforce length limit
-            if len(translated_text) > len(value):
-                translated_text = shorten_translation(value, translated_text)
-
-            return translated_text
 
         except Exception as e:
             print(f"Translation error for '{value}': {str(e)}")
-            return value  # Return the original value if translation fails
+            return value, value  # Return the original value if translation fails
 
-# Apply translation only to rows where src_col matches a shortlisted value
-def apply_translation(val, restored_translation_map):
-    if val in restored_translation_map:
-        return restored_translation_map[val]
-    return val
+    # Preserve the formatting of the original string
+    if value.isupper():
+        translated = translation.text.upper()
+    elif value.istitle():
+        translated = translation.text.title()
+    elif value.islower():
+        translated = translation.text.lower()
+    else:
+        translated = translation.text
+
+    # Enforce length limit
+    delta = len(translated) - len(value)
+    if delta > 0:
+        translated_short = shorten_translation(value, translated, delta)
+    else:
+        translated_short = translated
+
+    return translated, translated_short
 
 # Translate the specified column in the dataframe
-async def translate_column_async(file_df, src_col, trans_col):
-    word_pattern = re.compile(r'\b\w+\b')
-    tag_pattern = re.compile(r'\b([A-Za-z]+-\d+)\b')
-    # This pattern matches your tag only when it is not immediately preceded or followed by a letter or digit
-    #tag_pattern = re.compile(r'(?<![A-Za-z0-9])([A-Za-z]+-\d+)(?![A-Za-z0-9])')
+async def translate_column_async(trans_df, dict_df, src_col, trans_col, src_lang, trans_lang):
+    # Extract unique values containing alphabetic words
+    word_pattern = re.compile(r'\b[a-zA-Z]+\b')
+    unique_strings = {
+        match.strip()
+        for val, trans_val in zip(trans_df[src_col], trans_df[trans_col])
+        if pd.isna(trans_val) and isinstance(val, str)
+        for match in re.findall(r'(?:\b[a-zA-Z]+\b(?:\s+)?)+', val)
+        if any(word.isalpha() for word in word_pattern.findall(val))
+    }
 
-    # Extract unique values from the source column
-    unique_values = file_df[src_col].dropna().unique()
+    dictionary = {
+        str(row[src_lang]).strip().lower(): row[trans_lang]
+        for _, row in dict_df.iterrows()
+        if pd.notna(row[src_lang]) and pd.notna(row[trans_lang])
+    }
 
-    # Shortlist: only values that match the pattern
-    shortlist = [
-        val for val in unique_values
-        if isinstance(val, str) and any(word.isalpha() for word in word_pattern.findall(val))
-    ]
+    # Translate unique values
+    translation_map = {
+        val: await translate_value(val, dictionary, src_lang, trans_lang)
+        for val in tqdm(unique_strings, desc="Translating unique values")
+    }
 
-    # Map: original value -> (value_with_tag_placeholder, [tags])
-    tag_map = {}
-    for val in shortlist:
-        tags = tag_pattern.findall(val)
-        val_with_tag = tag_pattern.sub('***', val)
-        tag_map[val] = (val_with_tag, tags)
+    # Print translations
+    print("\nOriginal -> Translated -> Shortened")
+    for val, (translated, translated_short) in translation_map.items():
+        print(f"{val} -> {translated} -> {translated_short}")
 
-    # Build a set of unique values with tags replaced
-    shortlist_with_tags = list({v[0] for v in tag_map.values()})
-    print(f"\nShortlisted values for translation ({len(shortlist_with_tags)}):")
-    for val in shortlist_with_tags:
-        print(f"{val}")
+    # Build the list of dictionaries for the DataFrame
+    data = [{src_lang: val, trans_lang: translated_short} for val, (translated, translated_short) in translation_map.items()]
 
-    # Translation map for values
-    translation_map = {}
+    # Create the DataFrame
+    dict_df_new = pd.DataFrame(data, columns=[src_lang, trans_lang])
 
-    # Select languages for translation
-    languages = ["en", "es", "fr", "de", "it", "pt"]
-    src_lang = select_name(languages, "source language")
-    trans_lang = select_name(languages, "translated language")
+    print(f"\n{dict_df_new.fillna('').to_string(max_rows=20)}")
 
-    # Translate only shortlisted values
-    for value in tqdm(shortlist_with_tags, desc="Translating shortlisted values"):
-        translation_map[value] = await translate_value(value, {}, src_lang, trans_lang)
+    # Apply shortened translations to the dataframe
+    trans_df[trans_col] = trans_df.apply(
+        lambda row: translation_map[row[src_col]][1] if (
+                    pd.isna(row[trans_col]) and row[src_col] in translation_map
+        ) else (row[src_col] if pd.isna(row[trans_col]) else row[trans_col]),
+        axis=1
+    )
 
-    # Restore tags in translated values
-    restored_translation_map = {}
-    for orig_val, (val_with_tag, tags) in tag_map.items():
-        translated = translation_map[val_with_tag]
-        # Replace each *TAG* with the original tag, in order
-        for tag in tags:
-            translated = translated.replace('***', tag, 1)
-        restored_translation_map[orig_val] = translated
+    print(f"\n{trans_df.fillna('').to_string(max_rows=20)}")
 
-    print("\nRestored translation map:")
-    for orig_val, translated in restored_translation_map.items():
-        print(f"{orig_val} -> {translated}")
-
-    # Apply the translation to the dataframe
-    file_df[trans_col] = file_df[src_col].apply(lambda val: apply_translation(val, restored_translation_map))
-
-    print(f"\n{file_df.fillna('').to_string(max_rows=20)}")
-    return file_df
+    return trans_df, dict_df_new
 
 ## Write to excel file
-# Write translated column to excel file
-def write_trans_col(file_name, sheet_name, file_df, cols, trans_col):
+# Copy the original file to a new file with "_translated" suffix
+def copy_file(file_name):
     try:
         # Create a copy of the original file
         base, ext = os.path.splitext(file_name)
         copied_file_name = base + "_translated" + ext
         shutil.copy(file_name, copied_file_name)
 
+    except Exception as e:
+        print(f"\nError copying the file: {str(e)}. Exiting...")
+        exit()
+
+    return copied_file_name
+
+# Write translated column to excel file
+def write_col(file_name, sheet_name, file_df, col, start_row):
+    try:
+        base, ext = os.path.splitext(file_name)
         # Use keep_vba only for .xlsm files
         if ext.lower() == ".xlsm":
-            wb = openpyxl.load_workbook(copied_file_name, keep_vba=True)
+            wb = openpyxl.load_workbook(file_name, keep_vba=True)
         else:
-            wb = openpyxl.load_workbook(copied_file_name)
+            wb = openpyxl.load_workbook(file_name)
 
         if sheet_name not in wb.sheetnames:
             print(f"\nSheet {sheet_name} not found in the workbook.Exiting...")
             exit()
 
         ws = wb[sheet_name]
+        header = [cell.value for cell in ws[1]]
+        col_idx = header.index(col) + 1
+        row_idx = 2
+
+        if start_row != 2:
+            # Find the first empty row in src_col
+            while ws.cell(row=row_idx, column=col_idx).value not in (None, ""):
+                row_idx += 1
+            start_row = row_idx
 
         # Write the translated column to the sheet
-        for r_idx, value in enumerate(file_df[trans_col], start=1):  # Write values from the translated column
-            ws.cell(row=r_idx + 1, column=cols.index(trans_col) + 1, value=value)  # Write to the column defined by trans_col
+        for r_idx, value in enumerate(file_df[col], start=start_row):
+            ws.cell(row=r_idx, column=col_idx, value=value)
 
-        wb.save(copied_file_name)
+        wb.save(file_name)
         wb.close()
 
     except Exception as e:
         print(f"\nError writing to Excel: {str(e)}. Exiting...")
         exit()
+
+    return start_row
 
 ### Main
 
@@ -262,11 +294,36 @@ if __name__ == "__main__":
     root.withdraw()
 
     # Load excel file and create dataframes for map and list
-    messagebox.showinfo("Empty", "Words present in the translated columns will be kept. Please make sure to delete unwanted cells before proceeding")
-    file_name, sheet_name, file_df, cols, src_col, trans_col = load_file()
+    messagebox.showinfo("Empty", "Loading file to translate. Words present in the translated columns will be kept. Please make sure to delete unwanted cells before proceeding")
+    trans_file, trans_sheet = load_file()
+    trans_src, trans_trans = load_columns(trans_file, trans_sheet)
+    trans_df = load_df(trans_file, trans_sheet, trans_src, trans_trans)
 
-    # Run the asynchronous translation
-    file_df = asyncio.run(translate_column_async(file_df, src_col, trans_col))
+    # Select languages for translation
+    languages = ["en", "es", "fr", "de", "it", "pt"]
+    src_lang = select_name(languages, "source language")
+    trans_lang = select_name(languages, "translated language")
 
-    # Write the translated column to the excel file
-    write_trans_col(file_name, sheet_name, file_df, cols, trans_col)
+    # Load excel file for dictionary
+    messagebox.showinfo("Empty", "Loading dictionary file")
+    dict_file, dict_sheet = load_file()
+    dict_df = load_df(dict_file, dict_sheet, src_lang, trans_lang)
+
+    # Run the translation
+    trans_df, dict_df_new = asyncio.run(translate_column_async(trans_df, dict_df, trans_src, trans_trans, src_lang, trans_lang))
+
+    proceed_write_trans = messagebox.askyesno("Confirmation", "Do you want to write translation to the excel file?")
+    if proceed_write_trans:
+        # Write the translated column to the excel file
+        trans_copy = copy_file(trans_file)
+        start_row = write_col(trans_copy, trans_sheet, trans_df, trans_trans, 2)
+
+    proceed_write_dict = messagebox.askyesno("Confirmation", "Do you want to write dictionary to the excel file?")
+    if not proceed_write_dict:
+        print("\nOperation canceled. Exiting...")
+        exit()
+
+    # Load the dictionary file and write the dictionary dataframe
+    dict_copy = copy_file(dict_file)
+    start_row = write_col(dict_copy, dict_sheet, dict_df_new, src_lang, 0)
+    start_row = write_col(dict_copy, dict_sheet, dict_df_new, trans_lang, start_row)
